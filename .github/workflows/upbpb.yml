@@ -29,9 +29,12 @@ jobs:
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
       - name: 检查并更新 Worker
+        id: check_update
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -e
+          
           # 日志函数
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
@@ -44,12 +47,19 @@ jobs:
           # 获取最新 Release
           log "获取最新 Release 信息..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
-          if [ $? -ne 0 ]; then
+          
+          if [ -z "$RESPONSE" ]; then
             log "ERROR: 无法访问 GitHub API"
             exit 1
           fi
 
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "ERROR: 无法获取版本号"
+            exit 1
+          fi
+          
           DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
 
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
@@ -59,24 +69,38 @@ jobs:
           log "最新版本: $TAG_NAME"
 
           # 判断是否需要更新
-          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          FORCE_UPDATE="${{ github.event.inputs.force_update }}"
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "已是最新版本，无需更新"
+            echo "updated=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           # 下载并更新
           log "下载 $TARGET_FILE..."
-          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+          if ! wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"; then
+            log "ERROR: 下载失败"
+            exit 1
+          fi
+          
           log "解压 $TARGET_FILE..."
           unzip -o "$TARGET_FILE"
           rm "$TARGET_FILE"
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
+          
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "updated=true" >> $GITHUB_OUTPUT
+
+      - name: 配置 Git
+        if: steps.check_update.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: 提交更改
-        if: success() # 仅在更新成功时提交
+        if: steps.check_update.outputs.updated == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
